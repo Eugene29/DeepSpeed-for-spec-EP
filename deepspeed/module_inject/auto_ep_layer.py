@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Literal, NamedTuple
 
 import torch
+from torch.profiler import record_function
 import torch.nn as nn
 import deepspeed.comm as dist
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec, resolve_autoep_config_defaults
@@ -750,7 +751,8 @@ class AutoEPMoELayer(nn.Module):
             self._fused_combine_checked = True
 
         # Router
-        ro: RouterOutput = RouterOutput(*self.router(x, self.expert_bias))
+        with record_function("autoep/router"):
+            ro: RouterOutput = RouterOutput(*self.router(x, self.expert_bias))
 
         # Accumulate expert utilization
         with torch.no_grad():
@@ -834,23 +836,27 @@ class AutoEPMoELayer(nn.Module):
                     ep_group=self.ep_group,
                 )
             else:
-                plan = compute_split_plan(
-                    selected_experts=ro.selected_experts,
-                    num_experts=self.num_experts,
-                    ep_size=self.ep_size,
-                    num_local_experts=self.num_local_experts,
-                    ep_group=self.ep_group,
-                    num_tokens_per_expert=ro.num_tokens_per_expert,
-                )
+                with record_function("autoep/split_plan"):
+                    plan = compute_split_plan(
+                        selected_experts=ro.selected_experts,
+                        num_experts=self.num_experts,
+                        ep_size=self.ep_size,
+                        num_local_experts=self.num_local_experts,
+                        ep_group=self.ep_group,
+                        num_tokens_per_expert=ro.num_tokens_per_expert,
+                    )
 
-            routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
+            with record_function("autoep/dispatch_a2a"):
+                routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
 
-            routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, plan.local_counts_by_source)
-            expert_output = self.experts(routed_input, aligned_counts)
-            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
+            with record_function("autoep/experts"):
+                routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
+                    routed_input, plan.local_counts_by_source)
+                expert_output = self.experts(routed_input, aligned_counts)
+                expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
 
-            expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
+            with record_function("autoep/combine_a2a"):
+                expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
 
         if folded_tp:
             output = restore_combined(expert_output,
